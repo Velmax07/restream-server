@@ -3,117 +3,123 @@ const https = require('https');
 const url = require('url');
 
 const PORT = process.env.PORT || 3000;
+const SERVER_URL = process.env.SERVER_URL || `https://restream-server-production.up.railway.app`;
 
-// Cache de segmentos por stream
-const streamCache = {};
+const segmentCache = {};
+const CACHE_TTL = 10000;
+const playlistCache = {};
+const PLAYLIST_TTL = 3000;
 
-function fetchStream(streamUrl, res) {
-    const parsedUrl = url.parse(streamUrl);
-    const protocol = parsedUrl.protocol === 'https:' ? https : http;
+setInterval(() => {
+    const now = Date.now();
+    for (const key in segmentCache) {
+        if (now - segmentCache[key].timestamp > CACHE_TTL) delete segmentCache[key];
+    }
+    for (const key in playlistCache) {
+        if (now - playlistCache[key].timestamp > PLAYLIST_TTL) delete playlistCache[key];
+    }
+}, 30000);
 
-    const options = {
-        hostname: parsedUrl.hostname,
-        port: parsedUrl.port,
-        path: parsedUrl.path,
-        method: 'GET',
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (compatible; IPTV/1.0)',
-            'Accept': '*/*',
-            'Connection': 'keep-alive'
-        }
-    };
-
-    const req = protocol.request(options, (upstream) => {
-        // Adiciona headers CORS para permitir acesso de qualquer origem
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', '*');
-        res.setHeader('Content-Type', upstream.headers['content-type'] || 'application/vnd.apple.mpegurl');
-        res.statusCode = upstream.statusCode;
-
-        // Se for um .m3u8, reescreve as URLs dos segmentos para passar pelo proxy
-        if (streamUrl.includes('.m3u8')) {
-            let data = '';
-            upstream.on('data', chunk => { data += chunk.toString(); });
-            upstream.on('end', () => {
-                // Reescreve URLs relativas para absolutas passando pelo servidor
-                const baseUrl = streamUrl.substring(0, streamUrl.lastIndexOf('/') + 1);
-                const serverBase = process.env.SERVER_URL || `http://localhost:${PORT}`;
-
-                const rewritten = data.split('\n').map(line => {
-                    line = line.trim();
-                    if (line.startsWith('#') || line === '') return line;
-                    // URL absoluta
-                    if (line.startsWith('http')) {
-                        return `${serverBase}/proxy?url=${encodeURIComponent(line)}`;
-                    }
-                    // URL relativa
-                    return `${serverBase}/proxy?url=${encodeURIComponent(baseUrl + line)}`;
-                }).join('\n');
-
-                res.end(rewritten);
-            });
-        } else {
-            // Segmentos .ts — faz pipe direto
-            upstream.pipe(res);
-        }
+function fetchUrl(targetUrl) {
+    return new Promise((resolve, reject) => {
+        const parsed = url.parse(targetUrl);
+        const protocol = parsed.protocol === 'https:' ? https : http;
+        const options = {
+            hostname: parsed.hostname,
+            port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+            path: parsed.path,
+            method: 'GET',
+            headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': '*/*' }
+        };
+        const req = protocol.request(options, (res) => {
+            const chunks = [];
+            res.on('data', chunk => chunks.push(chunk));
+            res.on('end', () => resolve({
+                data: Buffer.concat(chunks),
+                contentType: res.headers['content-type'] || 'application/octet-stream',
+                statusCode: res.statusCode
+            }));
+        });
+        req.on('error', reject);
+        req.setTimeout(15000, () => { req.destroy(); reject(new Error('Timeout')); });
+        req.end();
     });
-
-    req.on('error', (err) => {
-        console.error('Erro ao buscar stream:', err.message);
-        if (!res.headersSent) {
-            res.statusCode = 502;
-            res.end('Erro ao conectar ao servidor IPTV');
-        }
-    });
-
-    req.setTimeout(15000, () => {
-        req.destroy();
-        if (!res.headersSent) {
-            res.statusCode = 504;
-            res.end('Timeout');
-        }
-    });
-
-    req.end();
 }
 
-const server = http.createServer((req, res) => {
-    const parsedUrl = url.parse(req.url, true);
+const pending = {};
 
-    // CORS preflight
-    if (req.method === 'OPTIONS') {
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', '*');
-        res.statusCode = 204;
-        res.end();
-        return;
-    }
+async function getWithCache(targetUrl, cache, ttl) {
+    const now = Date.now();
+    if (cache[targetUrl] && now - cache[targetUrl].timestamp < ttl) return cache[targetUrl];
+    if (pending[targetUrl]) return pending[targetUrl];
+    pending[targetUrl] = fetchUrl(targetUrl).then(result => {
+        cache[targetUrl] = { ...result, timestamp: Date.now() };
+        delete pending[targetUrl];
+        return cache[targetUrl];
+    }).catch(err => { delete pending[targetUrl]; throw err; });
+    return pending[targetUrl];
+}
 
-    // Rota de saúde
-    if (parsedUrl.pathname === '/') {
+function rewriteM3u8(content, baseUrl) {
+    return content.split('\n').map(line => {
+        line = line.trim();
+        if (line === '' || line.startsWith('#')) return line;
+        let absoluteUrl = line.startsWith('http') ? line : baseUrl + line;
+        return `${SERVER_URL}/proxy?url=${encodeURIComponent(absoluteUrl)}`;
+    }).join('\n');
+}
+
+const server = http.createServer(async (req, res) => {
+    const parsed = url.parse(req.url, true);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+
+    if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return; }
+
+    if (parsed.pathname === '/') {
         res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ status: 'ok', message: 'Servidor de re-stream funcionando!' }));
+        res.end(JSON.stringify({ status: 'ok', message: 'Servidor de re-stream funcionando!', segments_cached: Object.keys(segmentCache).length }));
         return;
     }
 
-    // Rota do proxy
-    if (parsedUrl.pathname === '/proxy') {
-        const streamUrl = parsedUrl.query.url;
-        if (!streamUrl) {
-            res.statusCode = 400;
-            res.end('URL não informada. Use /proxy?url=SUA_URL');
-            return;
+    if (parsed.pathname === '/proxy') {
+        const targetUrl = parsed.query.url;
+        if (!targetUrl) { res.statusCode = 400; res.end('URL não informada'); return; }
+
+        const decodedUrl = decodeURIComponent(targetUrl);
+        const isM3u8 = decodedUrl.includes('.m3u8');
+        const isTs = decodedUrl.includes('.ts');
+
+        console.log(`[${isM3u8 ? 'M3U8' : isTs ? 'TS' : 'FILE'}] ${decodedUrl}`);
+
+        try {
+            if (isM3u8) {
+                const result = await getWithCache(decodedUrl, playlistCache, PLAYLIST_TTL);
+                const baseUrl = decodedUrl.substring(0, decodedUrl.lastIndexOf('/') + 1);
+                const rewritten = rewriteM3u8(result.data.toString(), baseUrl);
+                res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+                res.statusCode = result.statusCode;
+                res.end(rewritten);
+            } else if (isTs) {
+                const result = await getWithCache(decodedUrl, segmentCache, CACHE_TTL);
+                res.setHeader('Content-Type', 'video/mp2t');
+                res.statusCode = result.statusCode;
+                res.end(result.data);
+            } else {
+                const result = await fetchUrl(decodedUrl);
+                res.setHeader('Content-Type', result.contentType);
+                res.statusCode = result.statusCode;
+                res.end(result.data);
+            }
+        } catch (err) {
+            console.error(`Erro: ${err.message}`);
+            if (!res.headersSent) { res.statusCode = 502; res.end('Erro: ' + err.message); }
         }
-
-        console.log(`[PROXY] ${new Date().toISOString()} → ${streamUrl}`);
-        fetchStream(decodeURIComponent(streamUrl), res);
         return;
     }
 
-    res.statusCode = 404;
-    res.end('Rota não encontrada');
+    res.statusCode = 404; res.end('Não encontrado');
 });
 
 server.listen(PORT, () => {
